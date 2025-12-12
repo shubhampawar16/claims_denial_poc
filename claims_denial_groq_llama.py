@@ -6,6 +6,7 @@ Python implementation with LangChain and Groq (llama-3.3-70b-versatile)
 
 import streamlit as st
 from langchain_groq import ChatGroq
+from langfuse_toolkit import LangfuseClient
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
@@ -17,6 +18,7 @@ import io
 import os
 from dotenv import load_dotenv
 load_dotenv()
+langfuse = LangfuseClient()
 
 # ============================================================================
 # DATA MODELS
@@ -93,6 +95,12 @@ DENIAL CATEGORIES (use one):
 - medical_necessity: Medical Necessity Not Established
 - duplicate: Duplicate Claim
 - coordination_benefits: Coordination of Benefits Issue
+- Eligibility & Enrollment
+- Patient Responsibility (Deductible / Copay / Coinsurance)
+- Contractual / Pricing / Fee Schedule
+- Missing Information / Documentation
+- Provider Credentialing / Setup
+- Bundling / NCCI Edits / Billing Rules
 
 YOUR TASK:
 1. Categorize this denial into one of the standard categories
@@ -125,7 +133,7 @@ Provide your analysis in the specified JSON format."""
             "payer_name": claim_data.payer_name or "Insurance Payer",
             "denial_text": claim_data.denial_text,
             "format_instructions": self.parser.get_format_instructions()
-        })
+        }, config={"callbacks": [langfuse.get_callback_handler()]})
         
         return result
 
