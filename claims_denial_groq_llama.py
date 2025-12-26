@@ -6,7 +6,6 @@ Python implementation with LangChain and Groq (llama-3.3-70b-versatile)
 
 import streamlit as st
 from langchain_groq import ChatGroq
-from langfuse_toolkit import LangfuseClient
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
@@ -18,6 +17,7 @@ import io
 import os
 from dotenv import load_dotenv
 load_dotenv()
+from langfuse_toolkit import LangfuseClient
 langfuse = LangfuseClient()
 
 # ============================================================================
@@ -133,7 +133,7 @@ Provide your analysis in the specified JSON format."""
             "payer_name": claim_data.payer_name or "Insurance Payer",
             "denial_text": claim_data.denial_text,
             "format_instructions": self.parser.get_format_instructions()
-        }, config={"callbacks": [langfuse.get_callback_handler()]})
+        })
         
         return result
 
@@ -395,7 +395,8 @@ Provide the extracted information in the specified JSON format."""
             "denial_letter_text": pdf_text,
             "default_date": default_date,
             "format_instructions": self.parser.get_format_instructions()
-        })
+        },
+        config={"callbacks": [langfuse.get_callback_handler()]})
         
         return result
 
@@ -419,6 +420,8 @@ def init_session_state():
         st.session_state.appeal_letter = None
     if 'claim_data' not in st.session_state:
         st.session_state.claim_data = None
+    if 'skip_pdf' not in st.session_state:
+        st.session_state.skip_pdf = False
 
 def main():
     st.set_page_config(
@@ -448,6 +451,7 @@ def main():
             st.session_state.analysis = None
             st.session_state.appeal_letter = None
             st.session_state.claim_data = None
+            st.session_state.skip_pdf = False
             st.rerun()
         
         st.divider()
@@ -476,11 +480,33 @@ def main():
     # ========================================================================
     st.header("📄 Step 1: Upload Denial Letter PDF")
     
-    pdf_file = st.file_uploader(
-        "Upload your denial letter in PDF format",
-        type=['pdf'],
-        help="Upload the payer denial letter PDF to automatically extract claim information"
-    )
+    # Show skip button if PDF not uploaded and not already skipped
+    if not st.session_state.pdf_uploaded and not st.session_state.skip_pdf:
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            pdf_file = st.file_uploader(
+                "Upload your denial letter in PDF format",
+                type=['pdf'],
+                help="Upload the payer denial letter PDF to automatically extract claim information"
+            )
+        
+        with col2:
+            # Align button with Browse files button - increased margin to match Browse files position
+            st.markdown('<div style="margin-top: 42px;"></div>', unsafe_allow_html=True)
+            if st.button("⏭️ Skip & Enter Manually", use_container_width=True, type="secondary"):
+                st.session_state.skip_pdf = True
+                st.rerun()
+    else:
+        pdf_file = st.file_uploader(
+            "Upload your denial letter in PDF format",
+            type=['pdf'],
+            help="Upload the payer denial letter PDF to automatically extract claim information"
+        )
+    
+    # Show message if user skipped PDF upload
+    if st.session_state.skip_pdf and not st.session_state.pdf_uploaded:
+        st.info("ℹ️ PDF upload skipped. You can enter claim details manually in Step 2 below.")
     
     if pdf_file:
         if not st.session_state.pdf_uploaded:
@@ -490,6 +516,7 @@ def main():
                 if pdf_text:
                     st.session_state.pdf_text = pdf_text
                     st.session_state.pdf_uploaded = True
+                    st.session_state.skip_pdf = False  # Reset skip flag if PDF is uploaded
                     st.success("✅ PDF text extracted successfully!")
                     
                     # Auto-extract claim information if API key is available
@@ -518,7 +545,7 @@ def main():
     # ========================================================================
     # SECTION 2: Claim Information (Auto-populated or Manual)
     # ========================================================================
-    if st.session_state.pdf_uploaded:
+    if st.session_state.pdf_uploaded or st.session_state.skip_pdf:
         st.divider()
         st.header("📝 Step 2: Review & Edit Claim Information")
         
