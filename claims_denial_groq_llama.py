@@ -45,6 +45,14 @@ class ClaimData(BaseModel):
     denial_text: str
     payer_name: Optional[str] = None
 
+class PDFValidationResult(BaseModel):
+    """PDF validation result structure"""
+    is_denial_letter: bool = Field(description="Whether the PDF is a claims denial letter")
+    confidence: float = Field(description="Confidence score between 0 and 1")
+    detected_document_type: str = Field(description="Type of document detected")
+    reasoning: str = Field(description="Explanation of validation decision")
+    key_indicators: List[str] = Field(description="Evidence supporting the decision")
+
 # ============================================================================
 # LANGCHAIN COMPONENTS WITH GROQ LLAMA
 # ============================================================================
@@ -322,6 +330,95 @@ class PDFParser:
             st.error(f"Error parsing PDF: {str(e)}")
             return ""
 
+class PDFValidator:
+    """Validate if PDF content is a claims denial letter using Groq Llama AI"""
+    
+    def __init__(self, api_key: str, model_name: str = "llama-3.3-70b-versatile"):
+        """
+        Initialize with Groq Llama model
+        
+        Args:
+            api_key: Groq API key
+            model_name: Groq model name
+        """
+        self.llm = ChatGroq(
+            model=model_name,
+            groq_api_key=api_key,
+            temperature=0.1,
+            max_tokens=1024
+        )
+        self.parser = PydanticOutputParser(pydantic_object=PDFValidationResult)
+    
+    def create_validation_chain(self):
+        """Create the PDF validation chain"""
+        
+        validation_template = """You are an expert medical billing document classifier.
+
+Analyze the following document text and determine if it is a CLAIMS DENIAL LETTER.
+
+DOCUMENT TEXT:
+{document_text}
+
+CLAIMS DENIAL LETTER CHARACTERISTICS:
+A claims denial letter typically contains:
+- Insurance payer/carrier information
+- Claim number or reference ID
+- Patient name and/or member ID
+- Service date or date of service
+- Denial reason or explanation (e.g., "not covered", "denied", "rejected", "requires authorization")
+- Medical billing codes (CPT codes, diagnosis codes, procedure codes)
+- Billed amount or claim amount
+- Language about appeal rights or reconsideration
+- Terms like: EOB (Explanation of Benefits), remittance advice, claim status, adjudication
+
+NOT DENIAL LETTERS (reject these):
+- Medical invoices or bills (requesting payment from patient)
+- Lab reports or test results
+- Medical records or clinical notes
+- Insurance cards or membership cards
+- Appointment reminders or schedules
+- Prescription information
+- General correspondence
+- Financial statements
+- Completely unrelated documents
+
+YOUR TASK:
+1. Determine if this is a claims denial letter (true/false)
+2. Provide confidence score (0.0 to 1.0) - be strict, use high confidence only for clear denial letters
+3. Identify the actual document type (e.g., "Claims Denial Letter", "Medical Invoice", "Lab Report", "Unknown Document")
+4. Explain your reasoning in 1-2 sentences
+5. List 3-5 key indicators that support your decision
+
+IMPORTANT:
+- Be STRICT: Only classify as denial letter if it clearly contains denial/rejection language from a payer
+- Patient bills/invoices are NOT denial letters (they're requests for payment TO the patient)
+- Medical records/reports are NOT denial letters
+- If unsure, set is_denial_letter to false
+
+{format_instructions}
+
+Provide your validation result in the specified JSON format."""
+
+        prompt = ChatPromptTemplate.from_template(validation_template)
+        chain = prompt | self.llm | self.parser
+        
+        return chain
+    
+    def validate_pdf_content(self, pdf_text: str) -> PDFValidationResult:
+        """Validate if PDF text is a claims denial letter"""
+        chain = self.create_validation_chain()
+        
+        # Truncate text if too long (use first 3000 chars for validation)
+        truncated_text = pdf_text[:3000] if len(pdf_text) > 3000 else pdf_text
+        
+        result = chain.invoke({
+            "document_text": truncated_text,
+            "format_instructions": self.parser.get_format_instructions()
+        })
+        
+        return result
+
+
 class PDFClaimExtractor:
     """Extract structured claim information from denial letter PDFs using Groq Llama AI"""
     
@@ -422,6 +519,11 @@ def init_session_state():
         st.session_state.claim_data = None
     if 'skip_pdf' not in st.session_state:
         st.session_state.skip_pdf = False
+    if 'pdf_validated' not in st.session_state:
+        st.session_state.pdf_validated = False
+    if 'validation_result' not in st.session_state:
+        st.session_state.validation_result = None
+
 
 def main():
     st.set_page_config(
@@ -452,7 +554,10 @@ def main():
             st.session_state.appeal_letter = None
             st.session_state.claim_data = None
             st.session_state.skip_pdf = False
+            st.session_state.pdf_validated = False
+            st.session_state.validation_result = None
             st.rerun()
+
         
         st.divider()
         
@@ -510,37 +615,107 @@ def main():
     
     if pdf_file:
         if not st.session_state.pdf_uploaded:
+            # Step 1: Extract text from PDF
+            pdf_text = None
             with st.spinner("📖 Extracting text from PDF..."):
                 pdf_text = PDFParser.extract_text_from_pdf(pdf_file)
+            
+            # Step 2: Process extracted text (outside spinner)
+            if pdf_text:
+                st.session_state.pdf_text = pdf_text
+                st.success("✅ PDF text extracted successfully!")
                 
-                if pdf_text:
-                    st.session_state.pdf_text = pdf_text
-                    st.session_state.pdf_uploaded = True
-                    st.session_state.skip_pdf = False  # Reset skip flag if PDF is uploaded
-                    st.success("✅ PDF text extracted successfully!")
+                # Step 3: Validate PDF content if API key is available
+                if api_key:
+                    validation_error = False
+                    validation_result = None
                     
-                    # Auto-extract claim information if API key is available
-                    if api_key:
-                        with st.spinner("🤖 Extracting claim information with Groq Llama AI..."):
-                            try:
-                                extractor = PDFClaimExtractor(api_key, model_name)
-                                extracted_data = extractor.extract_claim_info(pdf_text)
+                    with st.spinner("🔍 Validating PDF content..."):
+                        try:
+                            validator = PDFValidator(api_key, model_name)
+                            validation_result = validator.validate_pdf_content(pdf_text)
+                            st.session_state.validation_result = validation_result
+                        except Exception as e:
+                            validation_error = True
+                            st.error(f"❌ Error validating PDF: {str(e)}")
+                            st.warning("⚠️ Validation failed. You can still proceed, but please verify this is a denial letter.")
+                            st.session_state.pdf_validated = True  # Allow proceeding on validation error
+                            st.session_state.pdf_uploaded = True
+                            st.session_state.skip_pdf = False
+                    
+                    # Step 4: Process validation result (outside spinner)
+                    if not validation_error and validation_result:
+                        if validation_result.is_denial_letter:
+                            # Valid denial letter - proceed with extraction
+                            st.session_state.pdf_validated = True
+                            st.session_state.pdf_uploaded = True
+                            st.session_state.skip_pdf = False  # Reset skip flag if PDF is uploaded
+                            st.success(f"✅ Valid claims denial letter detected! (Confidence: {validation_result.confidence * 100:.0f}%)")
+                            
+                            # Step 5: Auto-extract claim information
+                            extracted_data = None
+                            extraction_error = False
+                            
+                            with st.spinner("🤖 Extracting claim information with Groq Llama AI..."):
+                                try:
+                                    extractor = PDFClaimExtractor(api_key, model_name)
+                                    extracted_data = extractor.extract_claim_info(pdf_text)
+                                except Exception as e:
+                                    extraction_error = True
+                                    st.error(f"❌ Error extracting claim information: {str(e)}")
+                                    st.info("💡 Please enter claim information manually below.")
+                            
+                            # Step 6: Process extraction result (outside spinner)
+                            if not extraction_error and extracted_data:
                                 st.session_state.extracted_data = extracted_data
                                 st.session_state.extraction_complete = True
                                 st.success("✅ Claim information extracted successfully!")
                                 st.rerun()
-                            except Exception as e:
-                                st.error(f"❌ Error extracting claim information: {str(e)}")
-                                st.info("💡 Please enter claim information manually below.")
-                    else:
-                        st.warning("⚠️ Please set GROQ_API_KEY in your .env file to auto-extract claim information.")
+                        else:
+                            # Not a denial letter - show error and block workflow
+                            st.session_state.pdf_validated = False
+                            st.session_state.pdf_uploaded = False
+                            st.session_state.pdf_text = None
+                            
+                            st.error(f"❌ **Invalid Document Type Detected**")
+                            st.warning(f"**Detected:** {validation_result.detected_document_type}")
+                            st.info(f"**Reason:** {validation_result.reasoning}")
+                            
+                            # Show key indicators in expander
+                            with st.expander("🔍 Detection Details"):
+                                st.markdown("**Key Indicators:**")
+                                for indicator in validation_result.key_indicators:
+                                    st.markdown(f"- {indicator}")
+                                st.markdown(f"\n**Confidence:** {validation_result.confidence * 100:.0f}%")
+                            
+                            st.markdown("---")
+                            st.info(
+                                "💡 **Please upload a claims denial letter** from your insurance payer. "
+                                "This should be an EOB (Explanation of Benefits), remittance advice, or "
+                                "denial notification that contains:\n"
+                                "- Denial reason or explanation\n"
+                                "- Claim number and patient information\n"
+                                "- Service dates and billed amounts\n"
+                                "- Medical billing codes (CPT, diagnosis codes)"
+                            )
+                            
+                            # Don't proceed to next steps
+                            st.stop()
                 else:
-                    st.error("❌ Could not extract text from PDF. Please try a different file.")
+                    # No API key - skip validation
+                    st.session_state.pdf_uploaded = True
+                    st.session_state.pdf_validated = True
+                    st.session_state.skip_pdf = False
+                    st.warning("⚠️ Please set GROQ_API_KEY in your .env file to enable PDF validation and auto-extraction.")
+            else:
+                st.error("❌ Could not extract text from PDF. Please try a different file.")
+
         
-        # Show extracted text in expander
-        if st.session_state.pdf_text:
+        # Show extracted text in expander (only if validated or validation skipped)
+        if st.session_state.pdf_text and st.session_state.pdf_validated:
             with st.expander("📄 View Extracted PDF Text"):
                 st.text_area("PDF Content", st.session_state.pdf_text, height=200, disabled=True)
+
     
     # ========================================================================
     # SECTION 2: Claim Information (Auto-populated or Manual)
